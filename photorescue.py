@@ -157,6 +157,17 @@ class RawReader:
 # Small binary helpers
 # --------------------------------------------------------------------------
 
+def run_cmd(args, timeout=120):
+    """subprocess.run wrapper that works on Python 3.5+ (capture_output and
+    text= are 3.7+, and some systems still ship an older python.exe)."""
+    try:
+        cp = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            universal_newlines=True, timeout=timeout)
+    except Exception as e:
+        return "", str(e)
+    return cp.stdout or "", cp.stderr or ""
+
+
 def u16(b, o, le=True):
     return int.from_bytes(b[o:o + 2], "little" if le else "big")
 
@@ -1089,11 +1100,7 @@ def parse_dollar_i(path):
 def list_shadow_copies():
     if not IS_WIN:
         return []
-    try:
-        cp = subprocess.run(["vssadmin", "list", "shadows"], capture_output=True, text=True, timeout=120)
-        out = cp.stdout
-    except Exception:
-        return []
+    out, _ = run_cmd(["vssadmin", "list", "shadows"], timeout=120)
     return re.findall(r"(\\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy\d+)", out)
 
 
@@ -1132,12 +1139,9 @@ def list_disks():
     if not IS_WIN:
         print("Not on Windows - point --source at a disk image file.")
         return
-    try:
-        cp = subprocess.run(["powershell", "-NoProfile", "-Command", PS_LIST],
-                            capture_output=True, text=True, timeout=180)
-        print(cp.stdout.strip() or cp.stderr.strip())
-    except Exception as e:
-        print("could not list disks: %s" % e)
+    out, err = run_cmd(["powershell", "-NoProfile", "-Command", PS_LIST], timeout=180)
+    text = out.strip() or err.strip()
+    print(text if text else "could not list disks (is powershell on PATH?)")
     print("\nScan a whole disk with:  --source \\\\.\\PhysicalDrive<N>")
     print("Scan one partition with: --source <DriveLetter>:")
 
@@ -1160,14 +1164,10 @@ def output_on_source(source_path, out_root):
         return False
     m = re.search(r"(?i)PhysicalDrive(\d+)", source_path)
     if m:
-        try:
-            cp = subprocess.run(["powershell", "-NoProfile", "-Command",
-                                 "(Get-Partition -DiskNumber %s).DriveLetter" % m.group(1)],
-                                capture_output=True, text=True, timeout=60)
-            letters = {c.strip().upper() for c in cp.stdout.split() if c.strip()}
-            return out_letter in letters
-        except Exception:
-            return False
+        out, _ = run_cmd(["powershell", "-NoProfile", "-Command",
+                          "(Get-Partition -DiskNumber %s).DriveLetter" % m.group(1)], timeout=60)
+        letters = set(c.strip().upper() for c in out.split() if c.strip())
+        return out_letter in letters
     m = re.search(r"(?i)^\\\\\.\\([A-Z]):$", source_path)
     if m:
         return out_letter == m.group(1).upper()
@@ -1177,6 +1177,11 @@ def output_on_source(source_path, out_root):
 # --------------------------------------------------------------------------
 
 def main():
+    if sys.version_info < (3, 6):
+        print("PhotoRescue needs Python 3.6 or newer (you have %s).\n"
+              "Install a current one with:  winget install -e --id Python.Python.3.12\n"
+              "then run it as:  py -3.12 photorescue.py ..." % sys.version.split()[0])
+        return 1
     ap = argparse.ArgumentParser(description="PhotoRescue - deep photo recovery")
     ap.add_argument("--list", action="store_true", help="list disks/partitions and exit")
     ap.add_argument("--source", help="D:  |  \\\\.\\PhysicalDrive1  |  1  |  image.img")
