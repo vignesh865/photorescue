@@ -67,8 +67,32 @@ Use `-Scope Process`, not a machine-wide policy change.
 |---|---|---|
 | `sweep` | Photos still on the filesystem, including hidden/system files, caches, temp dirs, and `$R…` Recycle Bin payloads | mounted volume (`--source D:`) |
 | `bin`   | Recycle Bin items with their **original filename and deletion date**, from the `$I` metadata records | drive letter |
+| `mft`   | Deleted files **with their original filename and folder path**, straight from the NTFS `$MFT`. Filter to one folder with `--folder` | admin, NTFS volume |
 | `vss`   | The same sweep inside every **Volume Shadow Copy** — often finds photos deleted weeks ago | admin, `vssadmin` snapshots exist |
 | `carve` | **Deep scan.** Reads every sector of the raw device and rebuilds files from their signatures — works on deleted, formatted, RAW/unmountable, and repartitioned disks | admin, raw device |
+
+## Recovering one folder you remember by name
+
+Carving cannot do this — it is filesystem-blind, it sees only image-shaped bytes, so folder
+and file names are gone. NTFS, though, keeps a deleted file's name, its parent folder and its
+cluster map in the `$MFT` long after the delete. That is the `mft` phase:
+
+```powershell
+# preview first - writes nothing
+py -3 photorescue.py --source D: --out E:\Recovered --phases mft --folder "Wedding" --dry-run
+
+# then actually pull them out
+py -3 photorescue.py --source D: --out E:\Recovered --phases mft --folder "Wedding"
+```
+
+`--folder` matches any folder whose name *contains* the text (case-insensitive) and pulls in
+every sub-folder beneath it. Add `--deleted-only` to skip files that still exist. It reads only
+the MFT, so it takes minutes, not hours — run it before, or alongside, a full carve; SHA-1
+dedup means output can share one `--out` folder safely.
+
+Files whose clusters have already been reused by newer data are reported as
+`had their data overwritten` rather than saved as garbage — for those, the deep `carve`
+is the remaining hope (an older copy may still be lying in unallocated space).
 
 `carve` is the one that matters after a delete or a format; it ignores the filesystem entirely.
 For a whole-disk deep scan point it at `\\.\PhysicalDrive<N>` (covers every partition plus
@@ -113,6 +137,9 @@ E:\Recovered\
 --min-size    ignore carved files smaller than N bytes (default 16384 — raise to 65536
               to skip icons/thumbnails, lower to 4096 to catch small pictures)
 --skip-video  don't recover mp4/mov/avi (much faster, much less output)
+--folder      mft/sweep/vss: only recover from folders whose name contains this
+--deleted-only  mft: skip files that still exist
+--dry-run     mft: list what would be recovered, write nothing
 --start/--end byte range, for scanning one partition of a disk
 --block       read block size in MB (default 16; 64 is faster on healthy SSDs)
 --resume      continue an interrupted scan into the same --out
@@ -150,5 +177,10 @@ py -3 photorescue.py --source E:\disk.img --out E:\Recovered --phases carve
   top part of the image intact.
 - Bad sectors are zero-filled rather than aborting the scan.
 - BitLocker-encrypted volumes must be unlocked first; a locked volume carves to nothing.
+- The `mft` phase is NTFS-only (exFAT/FAT SD cards have no MFT — carve those). It was
+  validated against a synthetic NTFS volume built for the purpose: nested deleted folders,
+  resident and non-resident data, fixup/update-sequence handling, and a file with reused
+  clusters — recovered files came back byte-identical, with the out-of-scope file correctly
+  excluded. Use `--dry-run` to confirm the paths look right on your own disk first.
 - Runs on macOS/Linux too against image files — that is how the carvers were tested
   (7/7 planted JPEG/PNG/GIF/HEIC/TIFF files recovered byte-identical by SHA-1).

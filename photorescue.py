@@ -968,6 +968,8 @@ def phase_sweep(root, out, args, label="sweep"):
     for entry in iter_files(root):
         scanned += 1
         name = entry.name
+        if args.folder and args.folder.lower() not in os.path.dirname(entry.path).lower():
+            continue
         ext = os.path.splitext(name)[1].lower()
         base = os.path.basename(entry.path)
         is_recycled = base.startswith("$R")
@@ -1094,6 +1096,359 @@ def parse_dollar_i(path):
 
 
 # --------------------------------------------------------------------------
+# Phase: NTFS $MFT scan  (recover deleted files WITH their names and folders)
+# --------------------------------------------------------------------------
+
+MFT_ROOT = 5
+ATTR_FILE_NAME = 0x30
+ATTR_DATA = 0x80
+
+
+def apply_fixups(rec, sector_size):
+    """NTFS scatters an update-sequence number over the last 2 bytes of every
+    sector of a record; put the real bytes back."""
+    usa_off = u16(rec, 0x04)
+    usa_cnt = u16(rec, 0x06)
+    if usa_cnt == 0 or usa_off + usa_cnt * 2 > len(rec):
+        return rec
+    usn = rec[usa_off:usa_off + 2]
+    out = bytearray(rec)
+    for i in range(1, usa_cnt):
+        end = i * sector_size
+        if end > len(out):
+            break
+        if bytes(out[end - 2:end]) != usn:
+            return None  # torn / not a real record
+        out[end - 2:end] = rec[usa_off + i * 2: usa_off + i * 2 + 2]
+    return bytes(out)
+
+
+def parse_runlist(data):
+    """Decode a data-run list into [(vcn, lcn_or_None_for_sparse, clusters)]."""
+    runs = []
+    off = 0
+    lcn = 0
+    vcn = 0
+    while off < len(data):
+        head = data[off]
+        if head == 0:
+            break
+        lsz = head & 0x0F
+        osz = head >> 4
+        off += 1
+        if lsz == 0 or off + lsz + osz > len(data):
+            break
+        count = int.from_bytes(data[off:off + lsz], "little")
+        off += lsz
+        if osz:
+            lcn += int.from_bytes(data[off:off + osz], "little", signed=True)
+            off += osz
+            runs.append((vcn, lcn, count))
+        else:
+            runs.append((vcn, None, count))  # sparse
+        vcn += count
+        if len(runs) > 8192:
+            break
+    return runs
+
+
+def iter_attributes(rec):
+    """Yield (type, name, is_nonresident, flags, payload) for each attribute.
+    payload is raw bytes for resident attrs, or (runs, real_size) if not."""
+    off = u16(rec, 0x14)
+    while off + 8 <= len(rec):
+        atype = u32(rec, off)
+        if atype == 0xFFFFFFFF:
+            return
+        alen = u32(rec, off + 4)
+        if alen < 16 or off + alen > len(rec):
+            return
+        non_res = rec[off + 8]
+        name_len = rec[off + 9]
+        name_off = u16(rec, off + 10)
+        flags = u16(rec, off + 12)
+        name = ""
+        if name_len:
+            name = rec[off + name_off: off + name_off + name_len * 2].decode("utf-16-le", "ignore")
+        if non_res:
+            run_off = u16(rec, off + 0x20)
+            real = u64(rec, off + 0x30)
+            runs = parse_runlist(rec[off + run_off: off + alen])
+            yield (atype, name, True, flags, (runs, real))
+        else:
+            vlen = u32(rec, off + 0x10)
+            voff = u16(rec, off + 0x14)
+            yield (atype, name, False, flags, rec[off + voff: off + voff + vlen])
+        off += alen
+
+
+def parse_filename_attr(val):
+    """-> (parent_index, name, namespace) from a $FILE_NAME value."""
+    if len(val) < 0x42:
+        return None
+    parent = u64(val, 0) & 0x0000FFFFFFFFFFFF
+    nlen = val[0x40]
+    ns = val[0x41]
+    name = val[0x42:0x42 + nlen * 2].decode("utf-16-le", "ignore")
+    return (parent, name, ns)
+
+
+class NTFSVolume:
+    def __init__(self, reader, base):
+        self.reader = reader
+        self.base = base
+        boot = reader.read_at(base, 512)
+        if len(boot) < 512 or boot[3:11] != b"NTFS    ":
+            raise ValueError("not NTFS")
+        self.bps = u16(boot, 0x0B)
+        spc = boot[0x0D]
+        if spc > 0x80:
+            spc = 1 << (256 - spc)
+        if self.bps not in (512, 1024, 2048, 4096) or spc == 0:
+            raise ValueError("bad NTFS geometry")
+        self.cluster = self.bps * spc
+        self.total_sectors = u64(boot, 0x28)
+        self.mft_lcn = u64(boot, 0x30)
+        v = boot[0x40]
+        self.rec_size = (1 << (256 - v)) if v > 0x80 else v * self.cluster
+        if self.rec_size not in (256, 512, 1024, 2048, 4096):
+            raise ValueError("bad MFT record size")
+        rec0 = self.raw_record_at(base + self.mft_lcn * self.cluster)
+        if rec0 is None:
+            raise ValueError("unreadable $MFT")
+        self.mft_runs, self.mft_size = None, 0
+        for atype, name, non_res, flags, payload in iter_attributes(rec0):
+            if atype == ATTR_DATA and not name and non_res:
+                self.mft_runs, self.mft_size = payload
+                break
+        if not self.mft_runs:
+            raise ValueError("$MFT has no data runs")
+        self.record_count = self.mft_size // self.rec_size
+
+    def raw_record_at(self, abs_off):
+        rec = self.reader.read_at(abs_off, self.rec_size)
+        if len(rec) < self.rec_size or rec[:4] != b"FILE":
+            return None
+        return apply_fixups(rec, self.bps)
+
+    def read_runs(self, runs, offset, length, real_size=None):
+        """Read from a non-resident stream by virtual offset."""
+        if real_size is not None:
+            length = min(length, max(0, real_size - offset))
+        out = bytearray()
+        for vcn, lcn, count in runs:
+            run_start = vcn * self.cluster
+            run_len = count * self.cluster
+            if run_start + run_len <= offset:
+                continue
+            if run_start >= offset + length:
+                break
+            take_from = max(offset, run_start)
+            take_to = min(offset + length, run_start + run_len)
+            n = take_to - take_from
+            if n <= 0:
+                continue
+            if lcn is None:
+                out.extend(b"\x00" * n)
+            else:
+                disk = self.base + lcn * self.cluster + (take_from - run_start)
+                chunk = self.reader.read_at(disk, n)
+                out.extend(chunk if len(chunk) == n else chunk + b"\x00" * (n - len(chunk)))
+        return bytes(out)
+
+    def record(self, index):
+        raw = self.read_runs(self.mft_runs, index * self.rec_size, self.rec_size)
+        if len(raw) < self.rec_size or raw[:4] != b"FILE":
+            return None
+        return apply_fixups(raw, self.bps)
+
+    def iter_records(self, chunk_records=1024):
+        """Stream every MFT record: yields (index, fixed_up_record)."""
+        total = self.record_count
+        idx = 0
+        while idx < total:
+            n = min(chunk_records, total - idx)
+            blob = self.read_runs(self.mft_runs, idx * self.rec_size, n * self.rec_size)
+            if not blob:
+                break
+            for i in range(n):
+                raw = blob[i * self.rec_size:(i + 1) * self.rec_size]
+                if len(raw) < self.rec_size or raw[:4] != b"FILE":
+                    continue
+                fixed = apply_fixups(raw, self.bps)
+                if fixed:
+                    yield (idx + i, fixed)
+            idx += n
+
+
+def find_volumes(reader):
+    """Return candidate NTFS volume start offsets: the source itself, plus every
+    MBR/GPT partition on it."""
+    offsets = [0]
+    sec = reader.sector or 512
+    mbr = reader.read_at(0, 512)
+    if len(mbr) >= 512 and mbr[510:512] == b"\x55\xaa":
+        gpt = False
+        for i in range(4):
+            e = mbr[0x1BE + i * 16: 0x1BE + (i + 1) * 16]
+            ptype = e[4]
+            start = u32(e, 8)
+            if ptype == 0xEE:
+                gpt = True
+            elif ptype and start:
+                offsets.append(start * sec)
+        if gpt:
+            hdr = reader.read_at(sec, 512)
+            if hdr[:8] == b"EFI PART":
+                ent_lba = u64(hdr, 72)
+                n_ent = u32(hdr, 80)
+                ent_sz = u32(hdr, 84)
+                if 0 < n_ent <= 256 and 128 <= ent_sz <= 1024:
+                    table = reader.read_at(ent_lba * sec, n_ent * ent_sz)
+                    for i in range(n_ent):
+                        e = table[i * ent_sz:(i + 1) * ent_sz]
+                        if len(e) < 56 or e[:16] == b"\x00" * 16:
+                            continue
+                        offsets.append(u64(e, 32) * sec)
+    seen = []
+    for o in offsets:
+        if o not in seen and (not reader.size or o < reader.size):
+            seen.append(o)
+    return seen
+
+
+def _build_path(dirs, index, cache):
+    if index in cache:
+        return cache[index]
+    parts = []
+    seen = set()
+    cur = index
+    while cur != MFT_ROOT and cur in dirs and cur not in seen:
+        seen.add(cur)
+        name, parent = dirs[cur]
+        parts.append(name)
+        cur = parent
+    path = "\\".join(reversed(parts)) if parts else ""
+    cache[index] = path
+    return path
+
+
+def phase_mft(source_path, out, args):
+    reader = RawReader(source_path)
+    want = (args.folder or "").lower()
+    exts = set(IMAGE_EXTS)
+    if not args.skip_video:
+        exts |= VIDEO_EXTS
+    try:
+        for base in find_volumes(reader):
+            try:
+                vol = NTFSVolume(reader, base)
+            except Exception:
+                continue
+            print("[mft] NTFS volume at offset %s: cluster %s, %d MFT records" % (
+                human(base), human(vol.cluster), vol.record_count))
+
+            # pass 1: directory tree (directories are a tiny fraction of the MFT)
+            dirs = {}
+            for idx, rec in vol.iter_records():
+                if not (u16(rec, 0x16) & 0x0002):
+                    continue
+                best = None
+                for atype, _n, non_res, _f, payload in iter_attributes(rec):
+                    if atype == ATTR_FILE_NAME and not non_res:
+                        fn = parse_filename_attr(payload)
+                        if fn and (best is None or fn[2] != 2):  # prefer non-DOS name
+                            best = fn
+                if best:
+                    dirs[idx] = (best[1], best[0])
+            print("[mft] %d directories indexed" % len(dirs))
+
+            targets = None
+            if want:
+                hit = set(i for i, (name, _p) in dirs.items() if want in name.lower())
+                if not hit:
+                    print('[mft] no folder matching "%s" on this volume' % args.folder)
+                    continue
+                # include every sub-folder underneath the matches
+                targets = set(hit)
+                changed = True
+                while changed:
+                    changed = False
+                    for i, (_n, parent) in dirs.items():
+                        if parent in targets and i not in targets:
+                            targets.add(i)
+                            changed = True
+                cache = {}
+                for i in sorted(hit):
+                    print('[mft] match: \\%s  (mft #%d)' % (_build_path(dirs, i, cache), i))
+                print("[mft] %d folders in scope (including sub-folders)" % len(targets))
+
+            # pass 2: files
+            cache = {}
+            found = saved = overwritten = 0
+            for idx, rec in vol.iter_records():
+                flags = u16(rec, 0x16)
+                if flags & 0x0002:
+                    continue
+                in_use = bool(flags & 0x0001)
+                if args.deleted_only and in_use:
+                    continue
+                fn = None
+                data = None
+                for atype, aname, non_res, aflags, payload in iter_attributes(rec):
+                    if atype == ATTR_FILE_NAME and not non_res:
+                        cand = parse_filename_attr(payload)
+                        if cand and (fn is None or cand[2] != 2):
+                            fn = cand
+                    elif atype == ATTR_DATA and not aname:
+                        data = (non_res, aflags, payload)
+                if not fn or data is None:
+                    continue
+                parent, name, _ns = fn
+                if targets is not None and parent not in targets:
+                    continue
+                ext = os.path.splitext(name)[1].lower()
+                if ext not in exts:
+                    continue
+                found += 1
+                non_res, aflags, payload = data
+                if non_res:
+                    runs, real = payload
+                    if aflags & 0x00FF:      # compressed / encrypted stream
+                        continue
+                    if not runs or real < args.min_size or real > 8 * GB:
+                        continue
+                    blob = vol.read_runs(runs, 0, real, real)
+                else:
+                    blob = payload
+                    if len(blob) < 512:
+                        continue
+                real_ext = sniff_ext(blob)
+                if not real_ext:
+                    overwritten += 1   # clusters already reused by another file
+                    continue
+                path = _build_path(dirs, parent, cache)
+                full = "\\" + (path + "\\" if path else "") + name
+                stem = os.path.splitext(name)[0]
+                if args.dry_run:
+                    saved += 1
+                    print("  would recover %s  (%s)%s" % (
+                        full, human(len(blob)), "" if in_use else "   [deleted]"))
+                    continue
+                if out.save_bytes(blob, real_ext, full, name_hint=stem):
+                    saved += 1
+                    if args.verbose:
+                        print("  + %s%s" % (full, "" if in_use else "   [deleted]"))
+                if found % 200 == 0:
+                    out.flush()
+            print("[mft] %d candidate files, %d %s, %d had their data overwritten"
+                  % (found, saved, "would be recovered (dry run)" if args.dry_run else "recovered",
+                     overwritten))
+    finally:
+        reader.close()
+
+
+# --------------------------------------------------------------------------
 # Phase: Volume Shadow Copies
 # --------------------------------------------------------------------------
 
@@ -1187,7 +1542,7 @@ def main():
     ap.add_argument("--source", help="D:  |  \\\\.\\PhysicalDrive1  |  1  |  image.img")
     ap.add_argument("--out", help="output folder (MUST be on a different disk)")
     ap.add_argument("--phases", default="carve",
-                    help="comma list of: sweep,bin,vss,carve  (default carve)")
+                    help="comma list of: sweep,bin,mft,vss,carve  (default carve)")
     ap.add_argument("--types", default="all",
                     help="jpg,png,gif,bmp,psd,raw,heic,video or all (default all)")
     ap.add_argument("--min-size", type=int, default=16 * KB, help="ignore carved files below this (bytes)")
@@ -1195,6 +1550,12 @@ def main():
     ap.add_argument("--start", type=int, default=0, help="start byte offset for carving")
     ap.add_argument("--end", type=int, default=0, help="end byte offset for carving (0 = end of disk)")
     ap.add_argument("--skip-video", action="store_true", help="do not recover mp4/mov/avi")
+    ap.add_argument("--folder", help="only recover from folders whose name contains this "
+                                     "(applies to the mft/sweep/vss phases)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="mft phase: list what would be recovered, write nothing")
+    ap.add_argument("--deleted-only", action="store_true",
+                    help="mft phase: skip files that still exist, recover only deleted ones")
     ap.add_argument("--no-organize", action="store_true", help="do not create YYYY-MM subfolders")
     ap.add_argument("--resume", action="store_true", help="resume a previous run into the same --out")
     ap.add_argument("--force", action="store_true", help="skip safety checks")
@@ -1248,6 +1609,8 @@ def main():
                     print("[bin] skipped: needs a drive letter source")
             else:
                 print("[bin] Windows only")
+        if "mft" in phases:
+            phase_mft(source, out, args)
         if "vss" in phases:
             phase_vss(out, args)
         if "carve" in phases:
