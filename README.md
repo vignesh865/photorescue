@@ -39,6 +39,28 @@ py -3 photorescue.py --source E:\disk.img --out E:\Recovered --phases carve --re
 
 If Python is missing: `winget install -e --id Python.Python.3.12` (tick *Add to PATH*).
 
+### "cannot be loaded ... not digitally signed" (UnauthorizedAccess)
+
+That is PowerShell's execution policy refusing an unsigned script — it is unrelated to being
+Administrator. Any one of these fixes it:
+
+```powershell
+# a) double-click / run the shim, which bypasses the policy for that process only
+.\Run-PhotoRescue.cmd -Source 1 -Out E:\Recovered -Phases sweep,bin,vss,carve
+
+# b) put the flag BEFORE -File (it does nothing if you just type .\Run-PhotoRescue.ps1)
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Run-PhotoRescue.ps1 -Source 1 -Out E:\Recovered
+
+# c) clear the Mark of the Web (set when the folder came from a download or USB), session-only policy
+Unblock-File .\Run-PhotoRescue.ps1
+Set-ExecutionPolicy -Scope Process Bypass -Force
+
+# d) ignore the wrapper completely - it is only a convenience launcher
+py -3 photorescue.py --source 1 --out E:\Recovered --phases sweep,bin,vss,carve
+```
+
+Use `-Scope Process`, not a machine-wide policy change.
+
 ## What "complete sweep" runs
 
 | Phase | What it recovers | Needs |
