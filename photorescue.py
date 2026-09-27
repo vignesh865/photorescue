@@ -76,25 +76,71 @@ if IS_WIN:
             size = int(geo.Cylinders) * geo.TracksPerCylinder * geo.SectorsPerTrack * sector
         return size, sector
 else:
+    # macOS / Linux raw devices report a size of 0 via stat, so ask the driver.
+    DKIOCGETBLOCKSIZE = 0x40046418      # darwin
+    DKIOCGETBLOCKCOUNT = 0x40086419     # darwin
+    BLKSSZGET = 0x1268                  # linux
+    BLKGETSIZE64 = 0x80081272           # linux
+
+    def _ioctl_int(fileobj, request, nbytes):
+        import fcntl
+        import array
+        buf = array.array("B", b"\x00" * nbytes)
+        fcntl.ioctl(fileobj.fileno(), request, buf, True)
+        return int.from_bytes(buf.tobytes(), sys.byteorder)
+
     def device_geometry(fileobj):
         try:
-            size = os.fstat(fileobj.fileno()).st_size
+            st = os.fstat(fileobj.fileno())
+            size = st.st_size
         except OSError:
-            size = 0
+            st, size = None, 0
+        sector = 512
+        import stat as _stat
+        is_dev = bool(st) and (_stat.S_ISBLK(st.st_mode) or _stat.S_ISCHR(st.st_mode))
+        if is_dev or not size:
+            try:
+                if sys.platform == "darwin":
+                    sector = _ioctl_int(fileobj, DKIOCGETBLOCKSIZE, 4) or 512
+                    blocks = _ioctl_int(fileobj, DKIOCGETBLOCKCOUNT, 8)
+                    size = blocks * sector or size
+                elif sys.platform.startswith("linux"):
+                    sector = _ioctl_int(fileobj, BLKSSZGET, 4) or 512
+                    size = _ioctl_int(fileobj, BLKGETSIZE64, 8) or size
+            except Exception:
+                pass
         if not size:
-            cur = fileobj.tell()
-            size = fileobj.seek(0, 2)
-            fileobj.seek(cur)
-        return size, 512
+            try:
+                cur = fileobj.tell()
+                size = fileobj.seek(0, 2)
+                fileobj.seek(cur)
+            except OSError:
+                size = 0
+        return size, sector
+
+
+PHONE_SOURCE_RE = re.compile(r"(?i)^(adb|phone|android)(:.*)?$")
+
+
+def is_phone_source(src):
+    return bool(src) and bool(PHONE_SOURCE_RE.match(src.strip()))
 
 
 def normalize_source(src):
-    """Accept 'D:', 'PhysicalDrive1', '1', a \\\\.\\ path, or a file path."""
+    """Accept 'D:', 'PhysicalDrive1', '1', a \\\\.\\ path, a file path, or
+    'adb' / 'adb:<serial>' for a phone plugged in over USB."""
+    s = src.strip()
+    if is_phone_source(s):
+        serial = s.split(":", 1)[1].strip() if ":" in s else ""
+        return "adb:" + serial if serial else "adb"
     if not IS_WIN:
         return src
-    s = src.strip()
+    if s.startswith("\\\\?\\"):
+        return s.rstrip("\\")          # \\?\Volume{guid} - letterless volume
     if s.startswith("\\\\.\\"):
         return s
+    if re.fullmatch(r"(?i)\{?[0-9a-f-]{36}\}?", s):
+        return "\\\\?\\Volume{%s}" % s.strip("{}")
     if re.fullmatch(r"[A-Za-z]:?\\?", s):
         return "\\\\.\\%s:" % s[0].upper()
     if re.fullmatch(r"\d+", s):
@@ -132,9 +178,13 @@ class RawReader:
         end = offset + length
         end += (-end) % sec
         if self.size and end > self.size:
-            end = self.size - (self.size % sec)
-            if end <= start:
-                end = start + sec
+            # Round *up* to the sector boundary, then clamp to the real size.
+            # Devices are a whole number of sectors so this never trims them,
+            # but an ordinary file (a cache blob, a disk image, a file pulled
+            # off a phone) almost always ends mid-sector - rounding down here
+            # made its last partial sector unreadable, and any picture whose
+            # end landed in it could not be carved.
+            end = self.size
         try:
             self.f.seek(start)
             data = self.f.read(end - start)
@@ -166,6 +216,17 @@ def run_cmd(args, timeout=120):
     except Exception as e:
         return "", str(e)
     return cp.stdout or "", cp.stderr or ""
+
+
+def run_bytes(args, timeout=600):
+    """Same, but keeps stdout as raw bytes - `adb exec-out` streams binary and
+    any text decoding would corrupt it."""
+    try:
+        cp = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            timeout=timeout)
+    except Exception as e:
+        return b"", str(e).encode("utf-8", "replace")
+    return cp.stdout or b"", cp.stderr or b""
 
 
 def u16(b, o, le=True):
@@ -678,6 +739,18 @@ class Output:
         self.counts = {}
         self.dupes = 0
         self.bytes_written = 0
+        self.min_free = 2 * GB
+
+    def free_bytes(self):
+        try:
+            import shutil
+            return shutil.disk_usage(self.root).free
+        except Exception:
+            return None
+
+    def space_low(self):
+        free = self.free_bytes()
+        return free is not None and free < self.min_free
 
     def _dest(self, ext, dt, stem):
         sub = ext.upper()
@@ -810,9 +883,10 @@ def human(n):
     return "%.1fPB" % n
 
 
-def phase_carve(source_path, out, args):
-    reader = RawReader(source_path)
-    extractor = RawReader(source_path)
+def phase_carve(source_path, out, args, reader_factory=None):
+    make_reader = reader_factory or (lambda: RawReader(source_path))
+    reader = make_reader()
+    extractor = make_reader()
     groups = set()
     for t in args.types.split(","):
         t = t.strip().lower()
@@ -924,6 +998,11 @@ def phase_carve(source_path, out, args):
                 with open(out.state_path, "w") as fh:
                     json.dump({"source": source_path, "offset": pos,
                                "updated": datetime.now().isoformat()}, fh)
+                if out.space_low():
+                    print("\n[carve] STOPPING: only %s free where --out points. Nothing is lost - "
+                          "free up space (or move --out to another disk) and re-run with --resume."
+                          % human(out.free_bytes() or 0))
+                    break
     except KeyboardInterrupt:
         print("\n[carve] interrupted - progress saved, re-run with --resume")
     finally:
@@ -993,6 +1072,9 @@ def phase_sweep(root, out, args, label="sweep"):
         stem = os.path.splitext(name)[0]
         if out.save_bytes(data, real_ext, entry.path, name_hint=stem, mtime=mtime):
             n += 1
+        if scanned % 500 == 0 and out.space_low():
+            print("\n[%s] STOPPING: low free space at --out (%s left)" % (label, human(out.free_bytes() or 0)))
+            break
         if scanned % 500 == 0:
             sys.stdout.write("\r[%s] scanned %d, recovered %d (%.0fs)   " % (label, scanned, n, time.time() - t0))
             sys.stdout.flush()
@@ -1093,6 +1175,839 @@ def parse_dollar_i(path):
     except Exception:
         pass
     return name, deleted
+
+
+# --------------------------------------------------------------------------
+# Phase: app caches and thumbnail stores
+# Browsers, QuickLook and Explorer keep copies of pictures inside opaque blob
+# files. Those blobs survive long after the original photo is deleted, so we
+# carve *inside* each cache file rather than just copying it.
+# --------------------------------------------------------------------------
+
+def default_cache_dirs():
+    home = os.path.expanduser("~")
+    cands = []
+    if sys.platform == "darwin":
+        cands += [
+            os.path.join(home, "Library/Caches/Google/Chrome"),
+            os.path.join(home, "Library/Application Support/Google/Chrome/Default/Cache"),
+            os.path.join(home, "Library/Caches/com.apple.Safari"),
+            os.path.join(home, "Library/Containers/com.apple.Safari/Data/Library/Caches"),
+            os.path.join(home, "Library/Caches/Firefox"),
+            os.path.join(home, "Library/Caches/com.microsoft.edgemac"),
+            os.path.join(home, "Library/Caches/com.brave.Browser"),
+            os.path.join(home, "Library/Containers/com.apple.Preview/Data/Library/Caches"),
+            os.path.join(home, "Library/Caches/com.apple.QuickLook.thumbnailcache"),
+            os.path.join(home, "Library/Application Support/Slack/Cache"),
+            os.path.join(home, "Library/Application Support/discord/Cache"),
+            os.path.join(home, "Library/Application Support/Telegram Desktop/tdata/user_data"),
+            os.path.join(home, "Library/Containers/ru.keepcoder.Telegram/Data/Library/Caches"),
+            os.path.join(home, "Library/Application Support/Signal/attachments.noindex"),
+        ]
+        import glob as _glob
+        # native macOS Telegram / WhatsApp keep media as plain files in group containers
+        # container root, not postbox/media - newer builds nest it under account-<id>/
+        cands += _glob.glob(os.path.join(home, "Library/Group Containers/*ru.keepcoder.Telegram"))
+        cands += _glob.glob(os.path.join(home, "Library/Group Containers/*whatsapp*.shared"))
+        cands += _glob.glob(os.path.join(home, "Library/Group Containers/*desktop.WhatsApp"))
+        out, _ = run_cmd(["getconf", "DARWIN_USER_CACHE_DIR"], timeout=20)
+        if out.strip():
+            cands.append(os.path.join(out.strip(), "com.apple.QuickLook.thumbnailcache"))
+    elif IS_WIN:
+        local = os.environ.get("LOCALAPPDATA", "")
+        roam = os.environ.get("APPDATA", "")
+        if local:
+            cands += [
+                os.path.join(local, r"Google\Chrome\User Data\Default\Cache"),
+                os.path.join(local, r"Microsoft\Edge\User Data\Default\Cache"),
+                os.path.join(local, r"Microsoft\Windows\Explorer"),      # thumbcache_*.db
+                os.path.join(local, r"Packages"),
+                os.path.join(local, "Temp"),
+            ]
+            import glob as _glob
+            cands += _glob.glob(os.path.join(local, r"Mozilla\Firefox\Profiles\*\cache2"))
+        if roam:
+            cands += [
+                os.path.join(roam, r"Telegram Desktop\tdata\user_data"),
+                os.path.join(roam, r"Signal\attachments.noindex"),
+                os.path.join(roam, r"WhatsApp\Cache"),
+            ]
+    else:
+        cands += [os.path.join(home, ".cache")]
+    return [p for p in cands if os.path.isdir(p)]
+
+
+def carve_file(path, out, args, sigs, overlap, source_label=None):
+    """Run the signature carvers over one ordinary file (a cache blob)."""
+    try:
+        reader = RawReader(path)
+        extractor = RawReader(path)
+    except (OSError, IOError):
+        return 0
+    saved = 0
+    try:
+        if reader.size and reader.size < 64:
+            return 0
+        block = 8 * MB
+        pos = 0
+        carry = b""
+        skip_until = 0
+        end = reader.size
+        while (not end) or pos < end:
+            data = reader.read_at(pos, block if not end else min(block, end - pos))
+            if not data:
+                break
+            buf = carry + data
+            base = pos - len(carry)
+            for rel, idx in scan_block(buf, sigs):
+                sig, sig_at, carver, maxsize, group = sigs[idx]
+                abs_off = base + rel
+                if abs_off + len(sig) <= pos:
+                    continue
+                file_off = abs_off - sig_at
+                if file_off < 0 or file_off < skip_until:
+                    continue
+                limit = min(maxsize, (end - file_off) if end else maxsize)
+                if limit < 512:
+                    continue
+
+                def rd(rel_off, n, _o=file_off):
+                    return extractor.read_at(_o + rel_off, n)
+
+                try:
+                    res = carver(rd, limit)
+                except Exception:
+                    res = None
+                if not res:
+                    continue
+                length, ext = res
+                if length < args.min_size or length > limit:
+                    continue
+                if args.skip_video and ext in ("mp4", "mov", "3gp", "avi", "m4v"):
+                    skip_until = file_off + length
+                    continue
+                if args.dry_run:
+                    saved += 1
+                    if args.verbose:
+                        print("  would recover %s from %s @0x%x" % (ext, path, file_off))
+                elif out.save_stream(extractor, file_off, length, ext, source_label or path):
+                    saved += 1
+                skip_until = file_off + length
+            carry = buf[-overlap:]
+            pos += len(data)
+    finally:
+        reader.close()
+        extractor.close()
+    return saved
+
+
+def phase_cache(source_path, out, args):
+    groups = set()
+    for t in args.types.split(","):
+        t = t.strip().lower()
+        if t == "all":
+            groups |= {"jpg", "png", "gif", "bmp", "psd", "raw", "iso", "riff"}
+        elif t in GROUP_ALIASES:
+            groups |= GROUP_ALIASES[t]
+    if args.skip_video:
+        groups.discard("riff")
+    sigs = select_signatures(groups)
+    overlap = max(len(x[0]) + x[1] for x in sigs) + 16
+
+    if source_path and os.path.isdir(source_path):
+        dirs = [source_path]
+    elif args.use_default_caches:
+        dirs = default_cache_dirs()
+    else:
+        print("[cache] refusing to scan this machine's caches without an explicit request.\n"
+              "        Point it at one folder:   --source ~/Library/Caches/Google/Chrome\n"
+              "        or opt in to all of them: --use-default-caches\n"
+              "        (add --dry-run first to see what it would pull out.)")
+        for d in default_cache_dirs():
+            print("        would scan: %s" % d)
+        return
+    if not dirs:
+        print("[cache] no known cache folders found on this machine")
+        return
+    print("[cache] scanning %d cache locations (carving inside each file)" % len(dirs))
+    total_files = total_saved = 0
+    t0 = time.time()
+    for d in dirs:
+        before = total_saved
+        n_files = 0
+        for entry in iter_files(d):
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            if st.st_size < args.min_size or st.st_size > 4 * GB:
+                continue
+            n_files += 1
+            total_files += 1
+            total_saved += carve_file(entry.path, out, args, sigs, overlap)
+            if total_files % 200 == 0:
+                sys.stdout.write("\r[cache] %d files scanned, %d images recovered (%.0fs)   "
+                                 % (total_files, total_saved, time.time() - t0))
+                sys.stdout.flush()
+                out.flush()
+                if out.space_low():
+                    print("\n[cache] STOPPING: low free space at --out")
+                    return
+        print("\r[cache] %-58s %4d files -> %d images" % (
+            (d[:55] + "...") if len(d) > 58 else d, n_files, total_saved - before))
+    print("[cache] done: %d files scanned, %d images recovered" % (total_files, total_saved))
+
+
+# --------------------------------------------------------------------------
+# Phase: Android phone over ADB
+#
+# A phone plugged into Windows is NOT a block device - Explorer talks MTP to
+# it, which is a logical file listing with no sectors behind it. So there is
+# nothing for the carver to read unless the phone is rooted AND unencrypted.
+#
+# What survives a delete on a modern Android is: the MediaStore trash
+# (`.trashed-<expiry>-<name>`, 30 days), the thumbnail stores, and app caches
+# (Google Photos especially). Those are ordinary files, so we enumerate them
+# over adb, stage them locally, and hand them to the same Output/dedup/EXIF
+# pipeline and the same carve-inside-a-blob logic the `cache` phase uses.
+# --------------------------------------------------------------------------
+
+ADB_HELP = (
+    "adb (Android Platform Tools) was not found.\n"
+    "  Windows:  winget install -e --id Google.PlatformTools\n"
+    "            (or unzip platform-tools next to this script / into C:\\platform-tools)\n"
+    "  macOS  :  brew install --cask android-platform-tools\n"
+    "Then on the phone: Settings > About phone > tap 'Build number' 7 times,\n"
+    "then Settings > Developer options > USB debugging = ON, and accept the\n"
+    "'Allow USB debugging?' prompt when you plug it in.")
+
+
+def find_adb():
+    """adb on PATH, else the usual SDK / unzipped-platform-tools locations."""
+    import shutil
+    p = shutil.which("adb")
+    if p:
+        return p
+    home = os.path.expanduser("~")
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = []
+    if IS_WIN:
+        local = os.environ.get("LOCALAPPDATA", "")
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        cands += [
+            os.path.join(here, "platform-tools", "adb.exe"),
+            os.path.join(local, r"Android\Sdk\platform-tools\adb.exe"),
+            os.path.join(home, r"AppData\Local\Android\Sdk\platform-tools\adb.exe"),
+            r"C:\platform-tools\adb.exe",
+            os.path.join(pf, r"platform-tools\adb.exe"),
+            os.path.join(home, r"Downloads\platform-tools\adb.exe"),
+            os.path.join(home, r"Desktop\platform-tools\adb.exe"),
+        ]
+    else:
+        cands += [
+            os.path.join(here, "platform-tools", "adb"),
+            os.path.join(home, "Library/Android/sdk/platform-tools/adb"),
+            os.path.join(home, "Android/Sdk/platform-tools/adb"),
+            "/opt/homebrew/bin/adb", "/usr/local/bin/adb",
+        ]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+class AdbError(Exception):
+    pass
+
+
+class AdbDevice:
+    """Thin wrapper around the adb CLI. All reads; nothing is written to the
+    phone (no `adb push`, no shell redirection onto its storage)."""
+
+    def __init__(self, serial=None, adb=None):
+        self.adb = adb or find_adb()
+        if not self.adb:
+            raise AdbError(ADB_HELP)
+        self.serial = serial or None
+        self._root_prefix = None
+        self._props = {}
+
+    # -- plumbing ----------------------------------------------------------
+    def _argv(self, *rest):
+        a = [self.adb]
+        if self.serial:
+            a += ["-s", self.serial]
+        return a + list(rest)
+
+    def shell(self, cmd, timeout=180):
+        out, _ = run_cmd(self._argv("shell", cmd), timeout=timeout)
+        return out.replace("\r\n", "\n")
+
+    def exec_out(self, cmd, timeout=1800):
+        """Binary-safe remote command. `adb shell` translates \\n on Windows and
+        would corrupt every file it pulls; `exec-out` does not."""
+        data, _ = run_bytes(self._argv("exec-out", cmd), timeout=timeout)
+        return data
+
+    def prop(self, name):
+        if name not in self._props:
+            self._props[name] = self.shell("getprop " + name, timeout=30).strip()
+        return self._props[name]
+
+    # -- discovery ---------------------------------------------------------
+    @staticmethod
+    def list_devices(adb=None):
+        """-> [(serial, state, description)]"""
+        adb = adb or find_adb()
+        if not adb:
+            return []
+        run_cmd([adb, "start-server"], timeout=60)
+        out, _ = run_cmd([adb, "devices", "-l"], timeout=60)
+        devs = []
+        for line in out.replace("\r\n", "\n").split("\n")[1:]:
+            line = line.strip()
+            if not line or line.startswith("*"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            serial, state = parts[0], parts[1]
+            info = {}
+            for kv in parts[2:]:
+                if ":" in kv:
+                    k, v = kv.split(":", 1)
+                    info[k] = v
+            desc = " ".join(x for x in (info.get("model"), info.get("device")) if x)
+            devs.append((serial, state, desc.replace("_", " ")))
+        return devs
+
+    def wait_ready(self):
+        for serial, state, _d in self.list_devices(self.adb):
+            if self.serial and serial != self.serial:
+                continue
+            if state == "unauthorized":
+                raise AdbError(
+                    "Phone %s is connected but not authorised.\n"
+                    "  Unlock the screen - there is an 'Allow USB debugging?' prompt.\n"
+                    "  Tick 'Always allow from this computer' and hit Allow, then re-run."
+                    % serial)
+            if state == "offline":
+                raise AdbError("Phone %s is offline. Unplug/replug the cable, or try a "
+                               "different USB port (a charge-only cable will do this)." % serial)
+            if state == "device":
+                self.serial = self.serial or serial
+                return
+        raise AdbError(
+            "No Android device visible to adb.\n"
+            "  - Unlock the phone and keep it unlocked.\n"
+            "  - Pull down the USB notification and set it to 'File transfer' / MTP.\n"
+            "  - Confirm USB debugging is ON in Developer options.\n"
+            "  - Use a data cable, not a charge-only one.")
+
+    # -- root / encryption -------------------------------------------------
+    def root_prefix(self):
+        """-> a command prefix that runs as root, or None. Cached."""
+        if self._root_prefix is not None:
+            return self._root_prefix or None
+        if "uid=0" in self.shell("id", timeout=30):
+            self._root_prefix = ""      # adbd already root (userdebug build)
+            return ""
+        for pref in ("su -c", "su 0", "su root"):
+            if "uid=0" in self.shell("%s id" % pref, timeout=45):
+                self._root_prefix = pref
+                return pref
+        self._root_prefix = False
+        return None
+
+    def su(self, cmd, timeout=180):
+        pref = self.root_prefix()
+        if pref is None:
+            raise AdbError("root required")
+        return self.shell("%s '%s'" % (pref, cmd) if pref else cmd, timeout=timeout)
+
+    def su_bytes(self, cmd, timeout=1800):
+        pref = self.root_prefix()
+        if pref is None:
+            raise AdbError("root required")
+        return self.exec_out("%s '%s'" % (pref, cmd) if pref else cmd, timeout=timeout)
+
+    def describe(self):
+        return {
+            "model": self.prop("ro.product.model") or "?",
+            "brand": self.prop("ro.product.brand") or "?",
+            "android": self.prop("ro.build.version.release") or "?",
+            "sdk": self.prop("ro.build.version.sdk") or "?",
+            "crypto": (self.prop("ro.crypto.type")
+                       or self.prop("ro.crypto.state") or "unknown"),
+        }
+
+
+# --- remote enumeration ----------------------------------------------------
+
+def adb_storage_roots(dev):
+    """Internal storage plus any physical SD card / USB-OTG volume."""
+    roots = []
+    for line in dev.shell("ls /storage 2>/dev/null", timeout=60).split():
+        name = line.strip()
+        if not name or name in ("self", "knox-emulated", "enc_emulated"):
+            continue
+        roots.append("/storage/" + name)
+    if not any(r.endswith("/emulated") for r in roots):
+        roots.append("/sdcard")
+    else:
+        roots = ["/sdcard"] + [r for r in roots if not r.endswith("/emulated")]
+    out = []
+    for r in roots:
+        probe = dev.shell("ls -d %s 2>/dev/null" % r, timeout=45).strip()
+        if probe and "No such" not in probe and "Permission denied" not in probe:
+            out.append(r.rstrip("/"))
+    seen = []
+    for r in out:
+        if r not in seen:
+            seen.append(r)
+    return seen
+
+
+def adb_find_files(dev, root, timeout=900):
+    """One `find` per storage root -> [(size, mtime, path)].
+
+    Tries the batched `stat` form first (one round trip for everything); some
+    toybox builds lack `-exec ... +`, so fall back to paths only."""
+    cmd = ("find '%s' -type f -exec stat -c '%%s|%%Y|%%n' {} + 2>/dev/null" % root)
+    text = dev.exec_out(cmd, timeout=timeout).decode("utf-8", "replace")
+    rows = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        try:
+            size_s, mtime_s, path = line.split("|", 2)
+            rows.append((int(size_s), int(mtime_s), path))
+        except ValueError:
+            continue
+    if rows:
+        return rows
+    text = dev.exec_out("find '%s' -type f 2>/dev/null" % root,
+                        timeout=timeout).decode("utf-8", "replace")
+    return [(-1, 0, p.strip()) for p in text.replace("\r\n", "\n").split("\n") if p.strip()]
+
+
+# --- what on a phone is worth looking at -----------------------------------
+
+# Paths whose contents are opaque blobs: carve *inside* them instead of
+# copying them. Matched case-insensitively as substrings of the full path.
+PHONE_BLOB_HINTS = (
+    "/.thumbnails/", "thumbdata", "/cache/", "/caches/", "/code_cache/",
+    "com.google.android.apps.photos", "/glide", "image_manager_disk_cache",
+    "/.face/", "/thumbnails/", "picasathumbs", "/blob_storage/",
+)
+
+# Always worth a look even though they hold no image extension.
+PHONE_ALWAYS = ("/lost.dir/", "/.trash", "/.trashed", "/trashed-")
+
+# App media stores that keep originals long after the gallery entry is gone.
+PHONE_APP_MEDIA = (
+    "com.whatsapp", "org.telegram", "com.instagram", "com.facebook.orca",
+    "org.thoughtcrime.securesms", "com.snapchat", "com.viber", "com.discord",
+    "com.microsoft.skydrive", "com.dropbox", "com.google.android.apps.docs",
+)
+
+PHONE_SKIP = (
+    "/android/obb/", "/.nomedia", "/netflix", "/spotify", "/music/",
+    "/audiobooks/", "/podcasts/", "/ringtones/", "/notifications/", "/alarms/",
+)
+
+
+def untrash_name(name):
+    """Android 11+ names a trashed item `.trashed-<expiry-epoch>-<original>`
+    and a pending one `.pending-<id>-<original>`. Give the real name back."""
+    m = re.match(r"^\.(?:trashed|pending)-\d+-(.+)$", name)
+    return (m.group(1), True) if m else (name, False)
+
+
+def classify_phone_file(path, size, args):
+    """-> ('photo'|'blob'|None, reason). Decides per remote path, before we
+    spend USB bandwidth pulling anything."""
+    low = path.lower()
+    name = path.rsplit("/", 1)[-1]
+    real_name, trashed = untrash_name(name)
+    ext = os.path.splitext(real_name)[1].lower()
+
+    if any(s in low for s in PHONE_SKIP) and not trashed:
+        return None, ""
+    exts = set(IMAGE_EXTS)
+    if not args.skip_video:
+        exts |= VIDEO_EXTS
+
+    if trashed or any(s in low for s in PHONE_ALWAYS):
+        return ("photo" if ext in exts else "blob"), "trash"
+    if any(s in low for s in PHONE_BLOB_HINTS):
+        # thumbnail stores and disk caches: carve inside. The floor is the
+        # same 512 bytes save_stream refuses below - a cached thumbnail is
+        # often only a few KB and is exactly what this phase exists to find.
+        if size >= 0 and size < 512:
+            return None, ""
+        return "blob", "cache"
+    if ext in exts:
+        return "photo", "file"
+    if any(s in low for s in PHONE_APP_MEDIA) and size >= max(4096, args.min_size):
+        return "blob", "app"
+    return None, ""
+
+
+def adb_pull(dev, remote, local, timeout=1800):
+    """adb pull keeps the remote path literal (no shell quoting to get wrong)
+    and -a preserves the timestamp, which we reuse when EXIF is missing."""
+    out, err = run_cmd(dev._argv("pull", "-a", remote, local), timeout=timeout)
+    if os.path.isfile(local) and os.path.getsize(local) > 0:
+        return True
+    # some adb builds reject -a on certain filesystems
+    run_cmd(dev._argv("pull", remote, local), timeout=timeout)
+    return os.path.isfile(local) and os.path.getsize(local) > 0
+
+
+def phase_phone(source, out, args):
+    serial = None
+    if ":" in source:
+        serial = source.split(":", 1)[1].strip() or None
+    try:
+        dev = AdbDevice(serial)
+        dev.wait_ready()
+    except AdbError as e:
+        print("[phone] %s" % e)
+        return
+
+    info = dev.describe()
+    print("[phone] %s %s - Android %s (API %s), serial %s" % (
+        info["brand"], info["model"], info["android"], info["sdk"], dev.serial))
+
+    crypto = (info["crypto"] or "").lower()
+    rooted = dev.root_prefix() is not None
+    print("[phone] root   : %s" % ("yes" if rooted else "no (file-level recovery only)"))
+    print("[phone] crypto : %s%s" % (
+        crypto or "unknown",
+        "  <- file-based encryption: a raw carve of the phone's storage returns "
+        "encrypted noise, even with root" if crypto == "file" else ""))
+    if rooted and crypto != "file":
+        print("[phone] this device may also support a real deep carve: "
+              "--phases carve --phone-dump E:\\phone.img")
+
+    groups = {"jpg", "png", "gif", "bmp", "psd", "raw", "iso", "riff"}
+    if args.skip_video:
+        groups.discard("riff")
+    sigs = select_signatures(groups)
+    overlap = max(len(x[0]) + x[1] for x in sigs) + 16
+
+    roots = adb_storage_roots(dev)
+    print("[phone] storage: %s" % ", ".join(roots))
+
+    staging = os.path.join(out.root, "_phone_staging")
+    os.makedirs(staging, exist_ok=True)
+
+    want = (args.folder or "").lower()
+    n_seen = n_cand = n_saved = n_failed = 0
+    budget = int(args.max_pull * GB) if args.max_pull else 0
+    pulled_bytes = 0
+    t0 = time.time()
+    by_reason = {}
+
+    try:
+        for root in roots:
+            print("[phone] enumerating %s ..." % root)
+            rows = adb_find_files(dev, root)
+            print("[phone] %s: %d files" % (root, len(rows)))
+            for size, mtime, path in rows:
+                n_seen += 1
+                if want and want not in path.lower():
+                    continue
+                kind, reason = classify_phone_file(path, size, args)
+                if not kind:
+                    continue
+                if size >= 0:
+                    if kind == "photo" and size < args.min_size:
+                        continue
+                    if size > 8 * GB:
+                        continue
+                    if budget and pulled_bytes + size > budget:
+                        print("\n[phone] --max-pull budget (%s) reached; stopping. "
+                              "Raise it or narrow with --folder." % human(budget))
+                        raise StopIteration
+                n_cand += 1
+                by_reason[reason] = by_reason.get(reason, 0) + 1
+
+                if args.dry_run:
+                    if args.verbose:
+                        print("  would pull [%s/%s] %s (%s)" % (
+                            kind, reason, path, human(size) if size >= 0 else "?"))
+                    continue
+
+                local = os.path.join(staging, "_pull.bin")
+                try:
+                    if os.path.exists(local):
+                        os.remove(local)
+                except OSError:
+                    pass
+                if not adb_pull(dev, path, local):
+                    n_failed += 1
+                    continue
+                try:
+                    st = os.stat(local)
+                except OSError:
+                    n_failed += 1
+                    continue
+                pulled_bytes += st.st_size
+
+                if kind == "blob":
+                    n_saved += carve_file(local, out, args, sigs, overlap,
+                                          source_label="%s:%s" % (dev.serial, path))
+                else:
+                    try:
+                        with open(local, "rb") as fh:
+                            data = fh.read()
+                    except OSError:
+                        n_failed += 1
+                        data = b""
+                    real_ext = sniff_ext(data) if data else None
+                    if real_ext:
+                        name = path.rsplit("/", 1)[-1]
+                        stem = os.path.splitext(untrash_name(name)[0])[0]
+                        when = datetime.fromtimestamp(mtime) if mtime else None
+                        if out.save_bytes(data, real_ext,
+                                          "%s:%s" % (dev.serial, path),
+                                          name_hint=stem, mtime=when):
+                            n_saved += 1
+                            if args.verbose:
+                                print("  + %s" % path)
+                    elif data:
+                        # wrong/missing extension - it may still be an image
+                        n_saved += carve_file(local, out, args, sigs, overlap,
+                                              source_label="%s:%s" % (dev.serial, path))
+                try:
+                    os.remove(local)
+                except OSError:
+                    pass
+
+                if n_cand % 25 == 0:
+                    sys.stdout.write("\r[phone] %d candidates, %d recovered, %s pulled (%.0fs)   "
+                                     % (n_cand, n_saved, human(pulled_bytes), time.time() - t0))
+                    sys.stdout.flush()
+                    out.flush()
+                    if out.space_low():
+                        print("\n[phone] STOPPING: low free space at --out")
+                        raise StopIteration
+    except StopIteration:
+        pass
+    finally:
+        try:
+            for leftover in os.listdir(staging):
+                os.remove(os.path.join(staging, leftover))
+            os.rmdir(staging)
+        except OSError:
+            pass
+
+    detail = ", ".join("%s=%d" % kv for kv in sorted(by_reason.items()))
+    print("\r[phone] %d files on the phone, %d candidates (%s), %d %s%s" % (
+        n_seen, n_cand, detail or "none", n_saved,
+        "would be recovered (dry run)" if args.dry_run else "recovered",
+        ", %d unreadable" % n_failed if n_failed else ""))
+    if not args.dry_run and n_saved == 0 and n_cand:
+        print("[phone] nothing new - those files were all duplicates of images you "
+              "already have in --out, or the caches held no full pictures.")
+
+
+# --- raw access to a rooted phone -----------------------------------------
+
+def adb_block_devices(dev):
+    """-> [(node, size_bytes, label)] for the partitions worth carving."""
+    found = []
+    names = dev.su("ls /dev/block/by-name/ 2>/dev/null", timeout=60).split()
+    for name in names:
+        if name.lower() not in ("userdata", "data", "media", "sdcard", "system", "cache"):
+            continue
+        node = dev.su("readlink -f /dev/block/by-name/%s" % name, timeout=45).strip()
+        if not node.startswith("/dev/"):
+            continue
+        size = adb_block_size(dev, node)
+        if size:
+            found.append((node, size, name))
+    if not found:
+        for line in dev.su("cat /proc/partitions", timeout=45).split("\n")[2:]:
+            parts = line.split()
+            if len(parts) == 4 and parts[3].startswith(("sd", "mmcblk", "dm-")):
+                node = "/dev/block/" + parts[3]
+                found.append((node, int(parts[2]) * 1024, parts[3]))
+    return found
+
+
+def adb_block_size(dev, node):
+    txt = dev.su("blockdev --getsize64 %s 2>/dev/null" % node, timeout=45).strip()
+    try:
+        return int(txt.split()[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+class AdbRawReader:
+    """RawReader-compatible view of a block device on a rooted phone, backed by
+    `dd` over adb. Every read is a USB round trip, so it caches aligned chunks -
+    the carvers do many small reads inside one file and would otherwise spawn a
+    process per read."""
+
+    CHUNK = 4 * MB
+    CACHE = 24
+
+    def __init__(self, dev, node, size=0, sector=512):
+        self.dev = dev
+        self.node = node
+        self.sector = sector or 512
+        self.size = size or adb_block_size(dev, node)
+        self.path = "%s:%s" % (dev.serial, node)
+        self._cache = {}
+        self._order = []
+
+    def close(self):
+        self._cache.clear()
+        del self._order[:]
+
+    def _chunk(self, index):
+        if index in self._cache:
+            return self._cache[index]
+        start = index * self.CHUNK
+        count = self.CHUNK // self.sector
+        if self.size:
+            remaining = self.size - start
+            if remaining <= 0:
+                return b""
+            count = min(count, (remaining + self.sector - 1) // self.sector)
+        data = self.dev.su_bytes(
+            "dd if=%s bs=%d skip=%d count=%d 2>/dev/null"
+            % (self.node, self.sector, start // self.sector, count), timeout=600)
+        if len(self._order) >= self.CACHE:
+            self._cache.pop(self._order.pop(0), None)
+        self._cache[index] = data
+        self._order.append(index)
+        return data
+
+    def read_at(self, offset, length):
+        if offset < 0 or length <= 0:
+            return b""
+        if self.size and offset >= self.size:
+            return b""
+        if self.size:
+            length = min(length, self.size - offset)
+        out = bytearray()
+        pos = offset
+        while len(out) < length:
+            index = pos // self.CHUNK
+            chunk = self._chunk(index)
+            if not chunk:
+                break
+            inner = pos - index * self.CHUNK
+            piece = chunk[inner:inner + (length - len(out))]
+            if not piece:
+                break
+            out.extend(piece)
+            pos += len(piece)
+        return bytes(out)
+
+
+def adb_dump_partition(dev, node, size, dest):
+    """Stream a whole partition to an image file on the PC. One sequential pass
+    is far faster than carving over per-read dd calls, and it leaves an image
+    you can re-scan without the phone attached."""
+    print("[phone] imaging %s (%s) -> %s" % (node, human(size) if size else "?", dest))
+    print("[phone] keep the cable still; this is one long read.")
+    t0 = time.time()
+    done = 0
+    with open(dest, "wb") as fh:
+        proc = subprocess.Popen(
+            dev._argv("exec-out", ("%s 'dd if=%s bs=1048576 2>/dev/null'"
+                                   % (dev.root_prefix(), node)).strip()
+                      if dev.root_prefix() else "dd if=%s bs=1048576 2>/dev/null" % node),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            while True:
+                buf = proc.stdout.read(4 * MB)
+                if not buf:
+                    break
+                fh.write(buf)
+                done += len(buf)
+                elapsed = time.time() - t0
+                rate = done / elapsed if elapsed else 0
+                pct = (done / size * 100.0) if size else 0.0
+                sys.stdout.write("\r[phone] imaged %s%s  %.1f MB/s   " % (
+                    human(done), ("  %5.2f%%" % pct) if size else "", rate / MB))
+                sys.stdout.flush()
+        except KeyboardInterrupt:
+            print("\n[phone] imaging interrupted - the partial image is still carvable")
+        finally:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    print("\n[phone] image written: %s (%s)" % (dest, human(done)))
+    return done
+
+
+def open_phone_carve_source(source, args):
+    """-> (reader_factory, label) for `--phases carve` against a phone, or None
+    with the reason printed."""
+    serial = source.split(":", 1)[1].strip() if ":" in source else None
+    try:
+        dev = AdbDevice(serial)
+        dev.wait_ready()
+    except AdbError as e:
+        print("[carve] %s" % e)
+        return None
+    if dev.root_prefix() is None:
+        print("[carve] this phone is not rooted, so its raw storage cannot be read at all "
+              "(adb gives files, not sectors).\n"
+              "        Use --phases phone instead - on an unrooted Android that is the whole\n"
+              "        recovery surface: trash, thumbnails and app caches.")
+        return None
+    crypto = (dev.prop("ro.crypto.type") or "").lower()
+    if crypto == "file" and not args.force:
+        print("[carve] this phone uses file-based encryption (ro.crypto.type=file).\n"
+              "        Carving its storage would return encrypted noise - every byte of\n"
+              "        userdata is encrypted with per-file keys held in hardware.\n"
+              "        Use --phases phone. Pass --force if you want to carve anyway.")
+        return None
+    parts = adb_block_devices(dev)
+    if not parts:
+        print("[carve] could not find a block device on the phone to read")
+        return None
+    node, size, label = parts[0]
+    for n, s, l in parts:
+        if l in ("userdata", "data"):
+            node, size, label = n, s, l
+            break
+    print("[carve] phone partition: %s (%s, %s)" % (node, label, human(size) if size else "?"))
+
+    if args.phone_dump:
+        adb_dump_partition(dev, node, size, args.phone_dump)
+        return (lambda: RawReader(args.phone_dump)), args.phone_dump
+    print("[carve] reading over adb directly. For anything but a quick look, image it\n"
+          "        first instead: --phone-dump E:\\phone.img (one pass, far faster).")
+    return (lambda: AdbRawReader(dev, node, size)), "%s:%s" % (dev.serial, node)
+
+
+def list_phones():
+    adb = find_adb()
+    if not adb:
+        print("\n=== Phones ===")
+        print(ADB_HELP)
+        return
+    devs = AdbDevice.list_devices(adb)
+    print("\n=== Phones (adb: %s) ===" % adb)
+    if not devs:
+        print("none detected - unlock the phone, set USB mode to 'File transfer',")
+        print("and turn on USB debugging in Developer options.")
+        return
+    for serial, state, desc in devs:
+        note = {"unauthorized": "  <- accept the 'Allow USB debugging?' prompt on the phone",
+                "offline": "  <- replug the cable"}.get(state, "")
+        print("  %-24s %-14s %s%s" % (serial, state, desc, note))
+    print("\nRecover from one with:  --source adb  (or --source adb:<serial>) --phases phone")
 
 
 # --------------------------------------------------------------------------
@@ -1281,6 +2196,26 @@ class NTFSVolume:
             idx += n
 
 
+def _walk_extended(reader, ext_base, sec):
+    """Logical drives (E:, F:, ...) live in a linked list of EBRs inside an MBR
+    extended partition - follow the chain."""
+    out = []
+    cur = ext_base
+    for _ in range(64):
+        ebr = reader.read_at(cur, 512)
+        if len(ebr) < 512 or ebr[510:512] != b"\x55\xaa":
+            break
+        e0 = ebr[0x1BE:0x1CE]
+        if e0[4] and u32(e0, 8):
+            out.append(cur + u32(e0, 8) * sec)      # logical volume, relative to this EBR
+        e1 = ebr[0x1CE:0x1DE]
+        nxt = u32(e1, 8)
+        if e1[4] not in (0x05, 0x0F, 0x85) or not nxt:
+            break
+        cur = ext_base + nxt * sec                  # next EBR, relative to the extended base
+    return out
+
+
 def find_volumes(reader):
     """Return candidate NTFS volume start offsets: the source itself, plus every
     MBR/GPT partition on it."""
@@ -1295,6 +2230,8 @@ def find_volumes(reader):
             start = u32(e, 8)
             if ptype == 0xEE:
                 gpt = True
+            elif ptype in (0x05, 0x0F, 0x85) and start:
+                offsets.extend(_walk_extended(reader, start * sec, sec))
             elif ptype and start:
                 offsets.append(start * sec)
         if gpt:
@@ -1317,6 +2254,29 @@ def find_volumes(reader):
     return seen
 
 
+def scan_for_ntfs(reader, granularity=MB, max_bytes=0):
+    """Partition table missing or damaged? Look for NTFS boot sectors directly.
+    Windows aligns partitions to 1 MB, so stepping 1 MB finds them cheaply."""
+    found = []
+    limit = min(max_bytes, reader.size) if max_bytes else reader.size
+    if not limit:
+        return found
+    off = 0
+    t0 = time.time()
+    while off < limit:
+        sec = reader.read_at(off, 512)
+        if len(sec) >= 11 and sec[3:11] == b"NTFS    ":
+            found.append(off)
+            print("\r[mft] NTFS boot sector found at %s" % human(off))
+        off += granularity
+        if time.time() - t0 > 2.0:
+            t0 = time.time()
+            sys.stdout.write("\r[mft] searching for volumes... %s / %s   " % (human(off), human(limit)))
+            sys.stdout.flush()
+    sys.stdout.write("\r" + " " * 60 + "\r")
+    return found
+
+
 def _build_path(dirs, index, cache):
     if index in cache:
         return cache[index]
@@ -1333,6 +2293,11 @@ def _build_path(dirs, index, cache):
     return path
 
 
+def _is_ntfs(reader, base):
+    sec = reader.read_at(base, 512)
+    return len(sec) >= 11 and sec[3:11] == b"NTFS    "
+
+
 def phase_mft(source_path, out, args):
     reader = RawReader(source_path)
     want = (args.folder or "").lower()
@@ -1340,7 +2305,16 @@ def phase_mft(source_path, out, args):
     if not args.skip_video:
         exts |= VIDEO_EXTS
     try:
-        for base in find_volumes(reader):
+        bases = find_volumes(reader)
+        if not any(_is_ntfs(reader, b) for b in bases):
+            print("[mft] no NTFS volume in the partition table - scanning the disk for one "
+                  "(a lost drive letter often means a damaged partition entry)")
+            bases = scan_for_ntfs(reader, granularity=max(512, int(args.scan_step * MB)),
+                                  max_bytes=int(args.scan_limit * GB))
+            if not bases:
+                print("[mft] still nothing. Try --scan-step 0.5 (slower, finds odd alignments), "
+                      "or use the carve phase, which needs no filesystem at all.")
+        for base in bases:
             try:
                 vol = NTFSVolume(reader, base)
             except Exception:
@@ -1441,6 +2415,10 @@ def phase_mft(source_path, out, args):
                         print("  + %s%s" % (full, "" if in_use else "   [deleted]"))
                 if found % 200 == 0:
                     out.flush()
+                    if out.space_low():
+                        print("[mft] STOPPING: low free space at --out (%s left)"
+                              % human(out.free_bytes() or 0))
+                        break
             print("[mft] %d candidate files, %d %s, %d had their data overwritten"
                   % (found, saved, "would be recovered (dry run)" if args.dry_run else "recovered",
                      overwritten))
@@ -1493,12 +2471,13 @@ Get-Disk | Sort-Object Number | ForEach-Object {
 def list_disks():
     if not IS_WIN:
         print("Not on Windows - point --source at a disk image file.")
-        return
-    out, err = run_cmd(["powershell", "-NoProfile", "-Command", PS_LIST], timeout=180)
-    text = out.strip() or err.strip()
-    print(text if text else "could not list disks (is powershell on PATH?)")
-    print("\nScan a whole disk with:  --source \\\\.\\PhysicalDrive<N>")
-    print("Scan one partition with: --source <DriveLetter>:")
+    else:
+        out, err = run_cmd(["powershell", "-NoProfile", "-Command", PS_LIST], timeout=180)
+        text = out.strip() or err.strip()
+        print(text if text else "could not list disks (is powershell on PATH?)")
+        print("\nScan a whole disk with:  --source \\\\.\\PhysicalDrive<N>")
+        print("Scan one partition with: --source <DriveLetter>:")
+    list_phones()
 
 
 def is_admin():
@@ -1539,10 +2518,11 @@ def main():
         return 1
     ap = argparse.ArgumentParser(description="PhotoRescue - deep photo recovery")
     ap.add_argument("--list", action="store_true", help="list disks/partitions and exit")
-    ap.add_argument("--source", help="D:  |  \\\\.\\PhysicalDrive1  |  1  |  image.img")
+    ap.add_argument("--source", help="D:  |  \\\\.\\PhysicalDrive1  |  1  |  image.img  |  "
+                                     "adb  |  adb:<serial>  (Android phone over USB)")
     ap.add_argument("--out", help="output folder (MUST be on a different disk)")
     ap.add_argument("--phases", default="carve",
-                    help="comma list of: sweep,bin,mft,vss,carve  (default carve)")
+                    help="comma list of: sweep,bin,cache,phone,mft,vss,carve  (default carve)")
     ap.add_argument("--types", default="all",
                     help="jpg,png,gif,bmp,psd,raw,heic,video or all (default all)")
     ap.add_argument("--min-size", type=int, default=16 * KB, help="ignore carved files below this (bytes)")
@@ -1552,12 +2532,27 @@ def main():
     ap.add_argument("--skip-video", action="store_true", help="do not recover mp4/mov/avi")
     ap.add_argument("--folder", help="only recover from folders whose name contains this "
                                      "(applies to the mft/sweep/vss phases)")
+    ap.add_argument("--scan-step", type=float, default=1.0,
+                    help="mft: step in MB when hunting for lost NTFS volumes (default 1.0)")
+    ap.add_argument("--scan-limit", type=float, default=0,
+                    help="mft: stop that hunt after this many GB (0 = whole disk)")
+    ap.add_argument("--use-default-caches", action="store_true",
+                    help="cache phase: opt in to scanning every known browser/app cache on "
+                         "this machine (otherwise --source must name one folder)")
+    ap.add_argument("--max-pull", type=float, default=0,
+                    help="phone phase: stop after pulling this many GB off the phone "
+                         "(0 = no limit)")
+    ap.add_argument("--phone-dump", metavar="IMG",
+                    help="phone + carve: image the phone's partition to this file first "
+                         "(rooted, unencrypted devices only), then carve the image")
     ap.add_argument("--dry-run", action="store_true",
-                    help="mft phase: list what would be recovered, write nothing")
+                    help="mft/phone/cache phases: list what would be recovered, write nothing")
     ap.add_argument("--deleted-only", action="store_true",
                     help="mft phase: skip files that still exist, recover only deleted ones")
     ap.add_argument("--no-organize", action="store_true", help="do not create YYYY-MM subfolders")
     ap.add_argument("--resume", action="store_true", help="resume a previous run into the same --out")
+    ap.add_argument("--min-free", type=float, default=2.0,
+                    help="stop when the output disk has less than this many GB free (default 2)")
     ap.add_argument("--force", action="store_true", help="skip safety checks")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -1565,32 +2560,77 @@ def main():
     if args.list:
         list_disks()
         return 0
-    if not args.source or not args.out:
+    phases_req = [x.strip().lower() for x in args.phases.split(",") if x.strip()]
+    if not args.out or (not args.source and phases_req != ["cache"]):
         ap.print_help()
+        if args.out and not args.source:
+            print("\nHint: --source is optional only for --phases cache "
+                  "(it then uses this machine's known cache folders).")
         return 2
+    if not args.source:
+        args.source = ""
 
-    source = normalize_source(args.source)
-    is_device = source.startswith("\\\\.\\")
+    source = normalize_source(args.source) if args.source else ""
+    is_phone = is_phone_source(source)
+    is_device = (not is_phone) and (source.startswith("\\\\.\\") or source.startswith("\\\\?\\"))
+    if not source:
+        is_device = False
 
-    if IS_WIN and is_device and not is_admin():
-        print("ERROR: raw disk access needs an elevated prompt. "
-              "Right-click PowerShell -> Run as administrator.")
-        return 1
-    if not is_device and not os.path.exists(source):
-        print("ERROR: source not found: %s" % source)
-        return 1
+    if is_phone:
+        # A phone is reached through adb, not through a device node: none of the
+        # disk checks below apply, and the output disk can never be the source.
+        if "phone" not in phases_req and "carve" not in phases_req:
+            print("Hint: an adb source is handled by --phases phone "
+                  "(add carve only for a rooted, unencrypted device).")
+    else:
+        if IS_WIN and is_device and not is_admin():
+            print("ERROR: raw disk access needs an elevated prompt. "
+                  "Right-click PowerShell -> Run as administrator.")
+            return 1
+        if source and not is_device and not os.path.exists(source):
+            print("ERROR: source not found: %s" % source)
+            return 1
+        try:
+            if not source or os.path.isdir(source):
+                raise StopIteration   # folder sources are for the sweep/cache phases
+            RawReader(source).close()
+        except StopIteration:
+            pass
+        except (OSError, IOError) as e:
+            print("ERROR: cannot open %s (%s)" % (source, e.strerror or e))
+            if is_device:
+                print("       That drive letter or device does not exist right now. Run\n"
+                      "         py -3 photorescue.py --list\n"
+                      "       to see what is actually attached. A letter that vanished was often an\n"
+                      "       external disk (plug it back in), a mapped network drive (`net use`), or a\n"
+                      "       subst alias (`subst`) - in the last two cases the files are not on this disk.")
+            return 1
 
-    if output_on_source(source, args.out) and not args.force:
-        print("ERROR: --out is on the same disk you are recovering. Writing there will "
-              "overwrite the very data you are trying to get back.\n"
-              "       Use an external drive or another disk (or --force if you really mean it).")
-        return 1
+        if source and output_on_source(source, args.out) and not args.force:
+            print("ERROR: --out is on the same disk you are recovering. Writing there will "
+                  "overwrite the very data you are trying to get back.\n"
+                  "       Use an external drive or another disk (or --force if you really mean it).")
+            return 1
 
     out = Output(args.out, resume=args.resume, organize=not args.no_organize)
+    out.min_free = int(args.min_free * GB)
+    free = out.free_bytes()
+    if free is not None:
+        print("Free space at %s: %s (scan stops below %s)" % (out.root, human(free), human(out.min_free)))
     phases = [p.strip().lower() for p in args.phases.split(",") if p.strip()]
     t0 = time.time()
     try:
-        if "sweep" in phases:
+        if is_phone:
+            for skipped in ("sweep", "bin", "mft", "vss"):
+                if skipped in phases:
+                    print("[%s] skipped: that phase needs a mounted Windows volume, and a "
+                          "phone is not one" % skipped)
+        if "phone" in phases:
+            if is_phone:
+                phase_phone(source, out, args)
+            else:
+                print("[phone] skipped: use --source adb (or adb:<serial>)")
+        if "sweep" in phases and not is_phone:
             root = source if not is_device else None
             if root is None:
                 m = re.search(r"(?i)^\\\\\.\\([A-Z]):$", source)
@@ -1599,7 +2639,7 @@ def main():
                 phase_sweep(root if root.endswith("\\") or not IS_WIN else root + "\\", out, args)
             else:
                 print("[sweep] skipped: sweep needs a mounted volume (use --source D:)")
-        if "bin" in phases:
+        if "bin" in phases and not is_phone:
             if IS_WIN:
                 m = re.search(r"(?i)^\\\\\.\\([A-Z]):$", source)
                 vol = (m.group(1) + ":") if m else (source.rstrip("\\") if len(source) <= 3 else None)
@@ -1609,12 +2649,20 @@ def main():
                     print("[bin] skipped: needs a drive letter source")
             else:
                 print("[bin] Windows only")
-        if "mft" in phases:
+        if "cache" in phases and not is_phone:
+            phase_cache(source if not is_device else None, out, args)
+        if "mft" in phases and not is_phone:
             phase_mft(source, out, args)
-        if "vss" in phases:
+        if "vss" in phases and not is_phone:
             phase_vss(out, args)
         if "carve" in phases:
-            phase_carve(source, out, args)
+            if is_phone:
+                picked = open_phone_carve_source(source, args)
+                if picked:
+                    factory, label = picked
+                    phase_carve(label, out, args, reader_factory=factory)
+            else:
+                phase_carve(source, out, args)
     finally:
         out.close()
     print("\n================ PhotoRescue finished in %s ================" %
